@@ -217,24 +217,66 @@ async def _extract_offer_links(page: Page) -> List[str]:
 
 
 async def _try_next_page(page: Page, config: ScraperConfig) -> bool:
-    for selector in [
-        "a[rel='next']",
-        "button[aria-label='Next']",
-        "a:has-text('Next')",
-        "button:has-text('Next')",
-        "a:has-text('下一頁')",
-        "button:has-text('下一頁')",
-    ]:
-        locator = page.locator(selector).first
-        if await locator.count() == 0 or not await locator.is_visible() or await locator.is_disabled():
+    def _normalize_links(hrefs: List[str]) -> List[str]:
+        return list(dict.fromkeys([(h or "").split("?")[0] for h in hrefs if isinstance(h, str) and h]))
+
+    async def _snapshot_offer_links() -> List[str]:
+        hrefs = await page.eval_on_selector_all(
+            "a[href*='/offer/']",
+            "els => els.map(e => e.getAttribute('href')).filter(Boolean)",
+        )
+        return _normalize_links(hrefs)
+
+    async def _active_page_number() -> str:
+        # 當前頁按鈕通常是 q-btn--standard + bg-font-default text-white
+        loc = page.locator(".q-pagination button.q-btn--standard .block").first
+        if await loc.count() == 0:
+            return ""
+        try:
+            return (await loc.inner_text()).strip()
+        except Exception:
+            return ""
+
+    before_links = await _snapshot_offer_links()
+    before_active = await _active_page_number()
+
+    # Quasar q-pagination 右箭頭（下一頁）
+    next_selectors = [
+        "button:has(i.material-icons:has-text('keyboard_arrow_right'))",
+        ".q-pagination button:has(i.material-icons:has-text('keyboard_arrow_right'))",
+    ]
+
+    for selector in next_selectors:
+        btn = page.locator(selector).first
+        if await btn.count() == 0:
             continue
-        current_url = page.url
-        await locator.click()
+        if not await btn.is_visible():
+            try:
+                await btn.scroll_into_view_if_needed()
+            except Exception:
+                pass
+        try:
+            if await btn.is_disabled():
+                continue
+        except Exception:
+            pass
+
+        try:
+            await btn.click(timeout=config.timeout_ms)
+        except Exception:
+            continue
+
         await page.wait_for_load_state("domcontentloaded", timeout=config.timeout_ms)
-        await page.wait_for_load_state("networkidle", timeout=config.timeout_ms)
         await _wait_for_offer_links(page, config)
         await _wait_and_sleep(page, config)
-        return page.url != current_url
+
+        after_active = await _active_page_number()
+        after_links = await _snapshot_offer_links()
+
+        # SPA 翻頁時 URL 可能不變，所以用 active page 或連結集合變化判斷
+        moved = (after_active and after_active != before_active) or (after_links and after_links != before_links)
+        return moved
+
     return False
 
 
